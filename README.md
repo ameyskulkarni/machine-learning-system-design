@@ -23,7 +23,7 @@ Each case study is a deep, self-contained teaching document: a 60-second answer,
 
 ## The 9-step framework
 
-This is the skeleton every case study in this repo applies. Interviewers grade *process* as much as they grade the final answer — a candidate who jumps straight to model architecture without scoping the problem first is the single most common way senior loops get failed.
+Adapted from [alirezadir/AIMLInterviews](https://github.com/alirezadir/AIMLInterviews/blob/main/src/MLSD/ml-system-design.md). This is the skeleton every case study in this repo applies. Interviewers grade *process* as much as they grade the final answer — a candidate who jumps straight to model architecture without scoping the problem first is the single most common way senior loops get failed.
 
 1. **Clarify & scope.** Functional vs. non-functional requirements. Scale (QPS, users, items), latency budget, freshness, hardware/edge constraints, privacy. Turn a vague prompt into a written spec before modeling anything.
 2. **Frame as an ML problem.** Define input → output precisely. What exactly is predicted? Is ML even the right tool, or does a heuristic baseline win? Pick the learning paradigm (classification / ranking / regression / retrieval / generation).
