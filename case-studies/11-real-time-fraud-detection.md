@@ -351,6 +351,8 @@ Transaction event
                               (weeks later) chargebacks / reports → labels → retrain
 ```
 
+**Name the pattern:** the feature-assembly step — a precomputed, batch-refreshed store merged at read time with a live streaming layer — is a textbook instance of the **Lambda architecture** (a batch layer for comprehensive-but-lagging aggregates, a speed layer for narrow-but-fresh counters, combined before serving). It shows up here because the two layers have complementary weaknesses: the online feature store is comprehensive (every aggregate you'd want) but its refresh job means it can lag reality by however long that job takes — a distributed key-value store like Redis/DynamoDB is usually tuned to favor availability and low read latency over strict consistency, so "the last write" isn't guaranteed to be visible to the next read. That's a fine tradeoff for a slow-moving aggregate like "total spend this month," but it's exactly the gap the streaming layer exists to patch: a 24-hour spend aggregate that's a few minutes stale could miss a burst of transactions from thirty seconds ago, which is precisely the pattern fraud rings exploit. Combining both layers gets you coverage (the batch side) and freshness (the speed side) where either alone leaves an exploitable seam.
+
 **Latency budget decomposition (say this out loud):** the model inference is usually *not* the bottleneck — a compiled GBDT scores in a few ms. **The feature fetch is.** That's precisely why slow features are precomputed into a fast online store and only cheap velocity counters are computed live. Budget it roughly: network + feature fetch (the big one) + inference + rules + decision, all inside ~50 ms.
 
 **The step-up option is a senior move.** Instead of a binary approve/decline on an uncertain score, issue a challenge (one-time passcode, 3-D Secure). It converts a risky guess into evidence — a real customer passes, a fraudster usually can't — at the cost of a little friction. It also softens the false-positive problem: you inconvenience rather than reject.
@@ -438,6 +440,7 @@ How candidates actually lose this question — these are delivery and process mi
 | What is the "step-up" decision option? | Instead of a binary approve/decline on an uncertain score, issue a challenge (OTP, 3-D Secure) — converts a risky guess into evidence at the cost of a little friction. |
 | Data drift vs. concept drift in fraud? | Data drift = inputs shift (new merchant, holiday spike). Concept drift = same-looking inputs, new truth (a new fraud pattern) — it needs new features/retraining, not just recalibration. |
 | Why must retraining be frequent? | The adversary actively probes and evades the current model, so its effectiveness has a shelf life measured in weeks, not months. |
+| Why combine an online store with a streaming layer? | The online store (Lambda architecture's batch layer) is comprehensive but can lag reality since distributed stores usually trade consistency for availability/latency; the streaming layer (speed layer) patches that gap with counters fresh to the last second. |
 
 ---
 
@@ -487,6 +490,8 @@ Rehearse until you can say this cold:
 - **Card-not-present (CNP)** — A transaction (e.g., e-commerce) where the physical card isn't presented to the merchant, as opposed to a card-present (swiped/inserted) transaction.
 - **Isolation forest / autoencoder** — Unsupervised anomaly-detection models (isolation forest isolates outliers via random partitioning; an autoencoder flags high reconstruction error) used as a safety net for novel, as-yet-unlabeled fraud patterns.
 - **Feature store** — A system that computes and serves features consistently — and point-in-time-correctly — for both offline training and online serving.
+- **Lambda architecture** — A system pattern combining a batch layer (comprehensive but refreshed periodically, so it can lag reality) with a speed layer (narrow but computed live), merged at read time; the fraud-detection feature assembly here (online store + streaming velocity counters) is a textbook instance.
+- **Eventual consistency** — A guarantee that a distributed store will *eventually* reflect a write, but not necessarily immediately on the next read; the tradeoff most online feature stores make in exchange for availability and low read latency, which is why a fast-moving counter needs a live streaming layer rather than relying on the store alone.
 - **Point-in-time correctness** — The guarantee that a feature used to score a historical event reflects only information available as of that event's timestamp, preventing feature/label leakage from the future.
 
 ---
