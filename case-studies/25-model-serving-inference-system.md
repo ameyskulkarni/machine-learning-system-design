@@ -199,6 +199,22 @@ The batching above assumes **every request does one fixed forward pass** — tru
 
 🎯 **Interview move:** *"If instead of this embedding model it were an LLM, static batching breaks because output length varies, so I'd switch to continuous batching with a paged KV cache."* Naming this shows you know generative serving isn't just "CV serving but bigger." (This is also the natural bridge to Q20, diffusion serving (coming soon), where the multi-step denoising loop is the analogous cost driver.)
 
+### 5.4 Caching layers — skipping the work entirely
+
+Batching makes redundant GPU *idle time* productive; caching goes a step further and skips the model call altogether when you already know the answer. A vague "I'd cache it" is a common but weak answer — naming the distinct layers, and when each one actually helps, is the differentiator.
+
+**Inference (response) cache.** Keyed on the exact input (or a hash of it), it stores the model's output and serves that back on a repeat, bypassing the model entirely. This is a real win when traffic is genuinely repetitive — re-embedding the same catalog image, re-scoring an FAQ question someone already asked today — and close to useless when inputs are unique per request, like a live personalized ranking pass where every user's feature vector differs from the last. Before reaching for it, ask: *what fraction of my traffic is actually a repeat of something already seen?* If that number is low, this cache buys nothing.
+
+**Feature cache.** A fast key-value store (Redis, Memcached) sitting in front of the feature store, so a request doesn't block on a database read for user/item/context features. Unlike the inference cache, this one fires on nearly *every* request — almost every model needs a feature lookup before it can score anything — which usually makes it the single highest-value cache in the system, and the first one to reach for when feature-fetch latency dominates the budget (see [Q3](./03-ad-ctr-prediction.md)'s ad-CTR case study, where feature fetch is called out as often the dominant serving cost).
+
+**Model-weight cache.** The model server keeping weights resident in GPU memory or on local NVMe across restarts, so a redeploy or a freshly autoscaled replica doesn't re-pull gigabytes from cold blob storage. This is the same idea already named as a cold-start mitigation in §7.2 ("fast model loading") — it's a caching decision, just an infrastructure one rather than a per-request one.
+
+**The failure mode all three share: invalidation.** Ship a new model version, and every cached prediction from the old version is now silently stale until it expires or gets evicted. Two fixes, in increasing order of safety and complexity: a **short TTL** (accept some bounded staleness and move on) or **event-driven invalidation** keyed on model version (flush or bypass the cache the moment the serving version changes) — the second is safer but only works if the cache key includes a version tag, which is easy to forget until an incident teaches you the hard way.
+
+> **Analogy — three different shortcuts, three different receipts.** The inference cache is a barista handing back a drink someone already paid for and never picked up — only works if someone ordered that exact drink recently. The feature cache is the barista's memorized regulars' orders — used on almost every customer. The model-weight cache is just keeping the espresso machine warm instead of unplugging it between customers. Change the recipe (ship a new model) and every cup already poured is now the wrong drink — that's invalidation.
+
+🎯 **Interview move:** *"I'd distinguish three caches here — an inference cache for genuinely repeat inputs, a feature cache that fires on nearly every request, and a model-weight cache that's really a cold-start mitigation — and I'd version-tag the inference cache's keys so a rollout doesn't quietly keep serving stale predictions from the model I just replaced."*
+
 ---
 
 ## 6. Deep dive — GPU utilization & model optimization
@@ -404,6 +420,7 @@ Cover the right column; recall it from the left.
 | Paged KV-cache | Manages the attention cache like OS virtual memory to avoid fragmentation; pairs with continuous batching in modern LLM serving (e.g., vLLM). |
 | Why tail latency, not average | Tail-latency amplification: in a fan-out system needing all N backend calls to succeed, the chance all N are fast shrinks fast even if each is fast 99% of the time — a great p50 can hide a broken p99. |
 | REST vs. gRPC — when | REST/JSON at the public edge (debuggable, universal tooling, no native streaming). gRPC/Protobuf on internal hops (binary, HTTP/2 multiplexing, native streaming) — the default for gateway→batcher→model-server traffic and for token-streaming LLM responses. |
+| Three cache layers | Inference cache (skip the model on a repeat input — only helps if traffic repeats), feature cache (Redis/Memcached in front of the feature store — fires on nearly every request), model-weight cache (keep weights warm in GPU memory/NVMe — a cold-start mitigation). All three need version-tagged invalidation when the model changes. |
 | Latency vs. throughput optimization | Latency optimization makes *one* request faster (helps p99); throughput optimization serves *more* requests per GPU-second (helps $/query). Batching is a throughput lever. |
 | Quantization | Run weights/activations at lower precision (FP16/BF16, INT8, FP8/INT4) for a large speedup with little to no quality loss — like saving a photo as a compressed JPEG. |
 | Distillation | Train a small student model to mimic a large teacher, then serve the cheaper student. |
@@ -427,7 +444,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 1. **Scope (5 min):** one model or a platform? modality (CV vs LLM/diffusion)? **p99 SLO, QPS, bursty?**, online vs batch, hardware/edge, cost, availability, model freshness. *Write the spec box.*
 2. **Reframe** as a service; draw the **request path**; pick a **protocol per hop** (REST at the public edge, gRPC internally); **decompose the latency budget**.
 3. **SLOs, not accuracy:** p50/p99/p99.9, throughput, availability, GPU util, **$/1k inferences**. Say *"tail latency is what breaks SLAs."*
-4. **Dynamic batching** — the throughput↔latency knob. `max_batch_size` + `max_batch_delay`, flush on B-or-T. Tie T to the budget. (LLM → **continuous batching + paged KV cache**.)
+4. **Dynamic batching** — the throughput↔latency knob. `max_batch_size` + `max_batch_delay`, flush on B-or-T. Tie T to the budget. (LLM → **continuous batching + paged KV cache**.) **Caching** is the complementary lever — inference cache (repeat inputs), feature cache (nearly every request), model-weight cache (cold-start mitigation) — all needing version-tagged invalidation.
 5. **GPU utilization / optimization** — quantization, distillation, pruning, **compilation** (TensorRT/torch.compile), MIG/packing. Latency vs throughput levers.
 6. **Autoscaling for burst** — scale on **queue depth / GPU util (not CPU)**; solve **cold start** with warm pools + predictive scaling + headroom.
 7. **Batch vs real-time paths** — same weights, two regimes; never backfill through the online endpoint.
@@ -446,12 +463,15 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Diffusion model** — a generative model that produces outputs through multiple iterative denoising steps, giving it a serving cost profile closer to an LLM's (variable, multi-step) than to a single-forward-pass CV model's.
 - **Distillation** — training a smaller "student" model to mimic a larger "teacher" model, then serving the cheaper student.
 - **Dynamic (adaptive) batching** — assembling a batch of incoming requests up to a size limit (`max_batch_size`) or a time limit (`max_batch_delay`), flushing on whichever bound is hit first, to trade a small added latency for much higher GPU throughput.
+- **Feature cache** — a fast key-value store (e.g., Redis, Memcached) placed in front of the feature store so a request's feature lookup doesn't block on a database read; typically the highest-traffic cache in a serving system since almost every request needs one.
 - **gRPC** — a high-performance RPC framework built on HTTP/2 and Protocol Buffers; the usual choice for internal, high-volume service-to-service calls (gateway → batcher → model server) where binary framing, multiplexed streams, and native bidirectional streaming outweigh REST's debuggability.
 - **Guardrail metric** — a metric (latency, error rate, a quality signal) that must not regress during a rollout, checked at every stage of the canary/ramp process.
+- **Inference (response) cache** — a cache keyed on the exact model input that stores and replays its output, skipping the model call entirely on a repeat; valuable only when traffic is genuinely repetitive, and needs a model-version tag in its key so a rollout doesn't serve stale predictions from the previous version.
 - **KV-cache / paged KV-cache** — the cache of attention key/value tensors an autoregressive model reuses across decoding steps; "paged" means managing it in fixed-size blocks like OS virtual memory to avoid fragmentation under continuous batching.
 - **Latency percentiles (p50 / p99 / p99.9)** — the median and tail latencies of a request-latency distribution; systems are budgeted and reported against tails, not just the mean, because tails are what breach an SLO.
 - **MIG (Multi-Instance GPU)** — an NVIDIA feature that partitions a single physical GPU into several isolated slices, so a small model doesn't need to monopolize a whole GPU.
 - **Model registry** — a versioned store of trained model artifacts plus their metadata (training data version, code commit, metrics, lineage), which underpins safe rollout and rollback.
+- **Model-weight cache** — keeping a model's weights resident in GPU memory or on local NVMe across restarts, so a redeploy or new replica doesn't re-pull gigabytes from cold storage; the same idea as the "fast model loading" cold-start mitigation, viewed as a caching decision.
 - **Multi-tenant platform** — a single serving system shared by many teams' models, as opposed to a dedicated service for one model; it needs isolation, per-tenant quotas, and a shared rollout/registry mechanism.
 - **OTA (Over-The-Air) update** — pushing a new model version to edge/on-device deployments remotely, without physical access to the device.
 - **Progressive delivery (rollout ladder)** — shipping a new model version through increasing exposure stages — offline eval, shadow, canary, progressive ramp, full rollout — each gated by guardrail checks.
