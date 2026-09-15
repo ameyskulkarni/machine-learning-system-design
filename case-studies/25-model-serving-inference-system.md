@@ -275,6 +275,17 @@ Mitigations (name several):
 
 > **Analogy — calling in extra cooks.** When the dinner rush hits, you call in more cooks — but they take 20 minutes to arrive (cold start). If you wait until the tickets pile up, you're already sunk. So you (a) keep a few extra cooks on standby (warm pool), (b) call them in *before* Friday night based on last week's pattern (predictive), and (c) never staff so lean that one bus of tourists ruins the night (headroom).
 
+### 7.3 When one replica isn't enough machine: partitioning the model itself
+
+Everything above assumes each replica holds one full copy of the model, and you scale by adding more identical replicas — that's **horizontal scaling**, and it covers most systems. But a model large enough (a 70B-parameter LLM, a big diffusion U-Net) doesn't fit in a single GPU's memory at all, so "add a replica" isn't even available until you first fit *one copy* of the model onto its hardware. That's a different axis of scaling — splitting one copy of the model across devices, not adding more copies — and it's easy to conflate with the data/model parallelism used to *train* these models (see [Q3](./03-ad-ctr-prediction.md)'s deep dive), but the serving-time version has its own two flavors:
+
+- **Tensor parallelism** — split individual weight matrices (e.g., one attention layer's projections) across GPUs, so every GPU computes a slice of every layer in lock-step. Needs fast interconnect (NVLink) because the GPUs communicate on *every* layer, which usually confines it to GPUs in the same node.
+- **Pipeline parallelism** — assign whole *layers* to different GPUs: GPU 1 runs layers 1-10 and hands its activations to GPU 2, which runs layers 11-20, and so on. Communicates far less often (once per stage boundary, not per layer), so it tolerates slower interconnect and can span multiple nodes — at the cost of a "bubble," where later stages sit idle waiting for the first micro-batch to arrive.
+
+Contrast this with **MIG** (§6.2), which runs in the *opposite* direction — carving one GPU into slices for several small models — and with plain horizontal replica scaling (§7.1), which only works once a single copy of the model already fits somewhere. A senior answer names the axis explicitly: *"is my unit of scaling a whole replica, or a shard of one model?"*
+
+🎯 **Interview move:** *"If the model doesn't fit on one accelerator, replica-count autoscaling isn't even on the table yet — I'd first tensor- or pipeline-parallelize it across a fixed-size GPU group, then treat that whole group as the unit I horizontally scale."*
+
 ---
 
 ## 8. Deep dive — Batch vs. real-time paths
@@ -428,6 +439,7 @@ Cover the right column; recall it from the left.
 | What signal should autoscaling use? | GPU utilization, queue depth, or latency-SLO headroom — never CPU utilization, which is meaningless for a GPU-bound service. |
 | The cold-start problem | Loading a multi-GB model onto a fresh GPU replica takes seconds to minutes, so reactive scaling alone is too slow for a spike. |
 | Cold-start mitigations | Warm pools / min replicas, predictive/scheduled scaling, provisioning headroom, fast model loading, scale-to-zero only for non-SLO paths. |
+| Model too big for one GPU | Tensor parallelism (split weight matrices across devices, needs fast interconnect, per-layer communication) or pipeline parallelism (split by layer, communicates only at stage boundaries, tolerates slower links, costs a "bubble"). Different axis from horizontal replica scaling, which assumes the model already fits on one device. |
 | Batch vs. real-time paths | Same model weights, two serving regimes: online (tight SLO, small dynamic batches, always-warm GPUs) vs. offline (no SLO, huge batches, cheap spot GPUs). Never backfill through the online endpoint. |
 | Shadow vs. canary | Shadow: the new model runs on mirrored traffic but its output is discarded — users never see it (pure validation). Canary: a small slice of real users actually receives the new model's output (limited exposure). |
 | The rollout ladder | Offline eval → shadow → canary (1-5%) → progressive ramp (5→25→50→100%) → full rollout, gated by guardrail metrics at each step. |
@@ -446,7 +458,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 3. **SLOs, not accuracy:** p50/p99/p99.9, throughput, availability, GPU util, **$/1k inferences**. Say *"tail latency is what breaks SLAs."*
 4. **Dynamic batching** — the throughput↔latency knob. `max_batch_size` + `max_batch_delay`, flush on B-or-T. Tie T to the budget. (LLM → **continuous batching + paged KV cache**.) **Caching** is the complementary lever — inference cache (repeat inputs), feature cache (nearly every request), model-weight cache (cold-start mitigation) — all needing version-tagged invalidation.
 5. **GPU utilization / optimization** — quantization, distillation, pruning, **compilation** (TensorRT/torch.compile), MIG/packing. Latency vs throughput levers.
-6. **Autoscaling for burst** — scale on **queue depth / GPU util (not CPU)**; solve **cold start** with warm pools + predictive scaling + headroom.
+6. **Autoscaling for burst** — scale on **queue depth / GPU util (not CPU)**; solve **cold start** with warm pools + predictive scaling + headroom. If the model itself doesn't fit on one GPU, **partition it first** (tensor or pipeline parallelism) — that's a different axis than replica-count autoscaling.
 7. **Batch vs real-time paths** — same weights, two regimes; never backfill through the online endpoint.
 8. **Safe rollout** — registry (MLflow) → offline eval → **shadow** → **canary** → ramp → 100%; **instant, automated rollback** (warm previous version, flip a pointer).
 9. **Monitoring** — operational (RED/USE) + quality (drift, delayed labels) → **triggers** autoscale, rollback, and retraining. Close the loop.
@@ -466,6 +478,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Feature cache** — a fast key-value store (e.g., Redis, Memcached) placed in front of the feature store so a request's feature lookup doesn't block on a database read; typically the highest-traffic cache in a serving system since almost every request needs one.
 - **gRPC** — a high-performance RPC framework built on HTTP/2 and Protocol Buffers; the usual choice for internal, high-volume service-to-service calls (gateway → batcher → model server) where binary framing, multiplexed streams, and native bidirectional streaming outweigh REST's debuggability.
 - **Guardrail metric** — a metric (latency, error rate, a quality signal) that must not regress during a rollout, checked at every stage of the canary/ramp process.
+- **Horizontal scaling** — adding more identical replicas of a service to handle more load, as opposed to partitioning a single oversized model across devices; the default scaling axis, available once one copy of the model already fits on one replica.
 - **Inference (response) cache** — a cache keyed on the exact model input that stores and replays its output, skipping the model call entirely on a repeat; valuable only when traffic is genuinely repetitive, and needs a model-version tag in its key so a rollout doesn't serve stale predictions from the previous version.
 - **KV-cache / paged KV-cache** — the cache of attention key/value tensors an autoregressive model reuses across decoding steps; "paged" means managing it in fixed-size blocks like OS virtual memory to avoid fragmentation under continuous batching.
 - **Latency percentiles (p50 / p99 / p99.9)** — the median and tail latencies of a request-latency distribution; systems are budgeted and reported against tails, not just the mean, because tails are what breach an SLO.
@@ -474,6 +487,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Model-weight cache** — keeping a model's weights resident in GPU memory or on local NVMe across restarts, so a redeploy or new replica doesn't re-pull gigabytes from cold storage; the same idea as the "fast model loading" cold-start mitigation, viewed as a caching decision.
 - **Multi-tenant platform** — a single serving system shared by many teams' models, as opposed to a dedicated service for one model; it needs isolation, per-tenant quotas, and a shared rollout/registry mechanism.
 - **OTA (Over-The-Air) update** — pushing a new model version to edge/on-device deployments remotely, without physical access to the device.
+- **Pipeline parallelism** — splitting a model by *layer* across devices (device 1 runs the first block of layers, device 2 the next, and so on); communicates only at stage boundaries, so it tolerates slower interconnect than tensor parallelism at the cost of pipeline "bubbles" (idle stages waiting on the first micro-batch).
 - **Progressive delivery (rollout ladder)** — shipping a new model version through increasing exposure stages — offline eval, shadow, canary, progressive ramp, full rollout — each gated by guardrail checks.
 - **Protocol Buffers (protobuf)** — Google's compact binary serialization format with a strongly-typed `.proto` schema; what gRPC uses on the wire instead of JSON, shrinking payloads and enforcing a contract between client and server.
 - **Pruning / sparsity** — removing low-importance weights from a trained model to shrink and speed it up.
@@ -489,6 +503,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Spot / preemptible GPU** — cheaper, interruptible cloud GPU capacity suitable for latency-insensitive batch jobs but not for an online SLO path.
 - **Tail latency** — the latency experienced by the slowest fraction of requests (e.g., p99, p99.9) rather than the average; the number that actually breaches an SLO.
 - **Tail-latency amplification** — the effect in a fan-out system (one request depending on several backend calls all succeeding) where the chance that *all* calls land in their individually rare slow tail rises quickly, making the overall p99 far worse than any single dependency's p99.
+- **Tensor parallelism** — splitting individual weight matrices (a single layer's math) across devices so every device computes a slice of every layer in lock-step; needs fast interconnect (NVLink) since devices communicate on every layer, usually confining it to one node.
 - **USE monitoring (Utilization, Saturation, Errors)** — an operational monitoring framework, applied here to GPUs, tracking how busy, how backed-up, and how failure-prone the hardware is.
 - **Warm pool** — a floor of already-running, model-loaded replicas kept ready so a traffic spike never has to wait through a cold start on the hot path.
 - **Load shedding / graceful degradation** — dropping or downgrading lower-priority requests under extreme load (rather than letting latency blow out for everyone) as part of a controlled response to a traffic spike.
@@ -517,4 +532,4 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 
 ---
 
-*Part of the [ML System Design Case Studies](../README.md) series. Connects to: [Q7](./07-visual-search-image-to-image.md) (visual search) and Q8 (semantic retrieval, coming soon) for the batch-embed-the-corpus vs. online-embed-the-query split · Q20 (diffusion serving, coming soon) for multi-step generative cost · [Q27](./27-data-labeling-active-learning.md) (data labeling / active learning), the queue that monitored failures feed back into · Q24 (distributed training, coming soon) and Q28 (monitoring/drift, coming soon), which together with this one form the "how models ship and stay alive" trilogy.*
+*Part of the [ML System Design Case Studies](../README.md) series. Connects to: [Q7](./07-visual-search-image-to-image.md) (visual search) and Q8 (semantic retrieval, coming soon) for the batch-embed-the-corpus vs. online-embed-the-query split · Q20 (diffusion serving, coming soon) for multi-step generative cost · [Q27](./27-data-labeling-active-learning.md) (data labeling / active learning), the queue that monitored failures feed back into · [Q3](./03-ad-ctr-prediction.md) for the training-time data/model-parallelism analog to this file's serving-time tensor/pipeline-parallelism split · Q24 (distributed training, coming soon) and Q28 (monitoring/drift, coming soon), which together with this one form the "how models ship and stay alive" trilogy.*
