@@ -113,6 +113,20 @@ flowchart LR
     REG[(Model Registry / MLflow)] -. load versioned artifact .-> MS
 ```
 
+### 3.1 Protocol choice: REST vs. gRPC
+
+Every arrow in that diagram is a network call, and the protocol behind each one has real latency and ergonomics consequences — naming this explicitly, rather than waving at "an API," is a small but real signal.
+
+**REST over HTTP/1.1 with JSON** is the default at the public edge — the client-facing hop. Browsers, third-party integrators, and a bored engineer with `curl` can all call it with zero special tooling, and payloads are human-readable, which matters when you're debugging an incident live. The cost is per-call overhead: JSON serialization/parsing, and text payloads that are meaningfully larger than binary (a 512-d float embedding as JSON runs 5-10x the bytes of its packed binary form) — plus HTTP/1.1 doesn't truly multiplex, so a slow call can hold up others behind it on the same connection.
+
+**gRPC over HTTP/2 with Protocol Buffers** is the default for the internal hops — gateway → batcher → model server, or model server → feature store — where call volume is highest and the overhead above actually compounds. Protobuf is compact binary with a strongly-typed `.proto` schema (client and server can't silently drift on a field's type), and HTTP/2 gives real multiplexed streams over one connection plus native bidirectional streaming. That last part is concretely useful: a token-streaming LLM response or a live video-frame pipeline maps naturally onto a gRPC stream, and awkwardly onto request/response REST (which usually fakes streaming with server-sent events or long-polling).
+
+The tradeoff you accept with gRPC: it isn't natively browser-friendly (you need a gRPC-web proxy in front of it), and it's harder to poke at ad hoc — no `curl`, you need `grpcurl` or generated client stubs, which slows down a 2 a.m. incident.
+
+> **Analogy — the front desk vs. the kitchen intercom.** The front desk (public API) talks to anyone who walks in, in plain language, because it doesn't know who's calling — a tourist, a delivery driver, a regular. The kitchen intercom (internal service calls) uses short, pre-agreed codewords between people who already know the system, because it gets used thousands of times a shift and every syllable saved adds up. REST is the front desk; gRPC is the intercom.
+
+🎯 **Interview move:** *"I'd put REST at the public edge, where debuggability and universal client support matter more than shaving milliseconds, and gRPC on the internal hops, where the call volume is highest and binary framing plus HTTP/2 multiplexing actually move the p99 needle."* Naming *which hop* gets which protocol — not picking one for the whole system — is the senior answer.
+
 The **latency budget** lives along this path. This is the first thing to decompose, because "p99 ≤ 80 ms" is a budget you have to *spend*:
 
 | Segment | Typical cost | Notes / where to cut |
@@ -389,6 +403,7 @@ Cover the right column; recall it from the left.
 | Continuous (in-flight) batching | For autoregressive LLMs, evicts finished sequences and admits new ones at each decoding step instead of waiting for the whole static batch to finish — keeps the GPU packed despite variable output length. |
 | Paged KV-cache | Manages the attention cache like OS virtual memory to avoid fragmentation; pairs with continuous batching in modern LLM serving (e.g., vLLM). |
 | Why tail latency, not average | Tail-latency amplification: in a fan-out system needing all N backend calls to succeed, the chance all N are fast shrinks fast even if each is fast 99% of the time — a great p50 can hide a broken p99. |
+| REST vs. gRPC — when | REST/JSON at the public edge (debuggable, universal tooling, no native streaming). gRPC/Protobuf on internal hops (binary, HTTP/2 multiplexing, native streaming) — the default for gateway→batcher→model-server traffic and for token-streaming LLM responses. |
 | Latency vs. throughput optimization | Latency optimization makes *one* request faster (helps p99); throughput optimization serves *more* requests per GPU-second (helps $/query). Batching is a throughput lever. |
 | Quantization | Run weights/activations at lower precision (FP16/BF16, INT8, FP8/INT4) for a large speedup with little to no quality loss — like saving a photo as a compressed JPEG. |
 | Distillation | Train a small student model to mimic a large teacher, then serve the cheaper student. |
@@ -410,7 +425,7 @@ Cover the right column; recall it from the left.
 Memorize this order; it's your whiteboard spine for a 45-minute pass.
 
 1. **Scope (5 min):** one model or a platform? modality (CV vs LLM/diffusion)? **p99 SLO, QPS, bursty?**, online vs batch, hardware/edge, cost, availability, model freshness. *Write the spec box.*
-2. **Reframe** as a service; draw the **request path**; **decompose the latency budget**.
+2. **Reframe** as a service; draw the **request path**; pick a **protocol per hop** (REST at the public edge, gRPC internally); **decompose the latency budget**.
 3. **SLOs, not accuracy:** p50/p99/p99.9, throughput, availability, GPU util, **$/1k inferences**. Say *"tail latency is what breaks SLAs."*
 4. **Dynamic batching** — the throughput↔latency knob. `max_batch_size` + `max_batch_delay`, flush on B-or-T. Tie T to the budget. (LLM → **continuous batching + paged KV cache**.)
 5. **GPU utilization / optimization** — quantization, distillation, pruning, **compilation** (TensorRT/torch.compile), MIG/packing. Latency vs throughput levers.
@@ -431,6 +446,7 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Diffusion model** — a generative model that produces outputs through multiple iterative denoising steps, giving it a serving cost profile closer to an LLM's (variable, multi-step) than to a single-forward-pass CV model's.
 - **Distillation** — training a smaller "student" model to mimic a larger "teacher" model, then serving the cheaper student.
 - **Dynamic (adaptive) batching** — assembling a batch of incoming requests up to a size limit (`max_batch_size`) or a time limit (`max_batch_delay`), flushing on whichever bound is hit first, to trade a small added latency for much higher GPU throughput.
+- **gRPC** — a high-performance RPC framework built on HTTP/2 and Protocol Buffers; the usual choice for internal, high-volume service-to-service calls (gateway → batcher → model server) where binary framing, multiplexed streams, and native bidirectional streaming outweigh REST's debuggability.
 - **Guardrail metric** — a metric (latency, error rate, a quality signal) that must not regress during a rollout, checked at every stage of the canary/ramp process.
 - **KV-cache / paged KV-cache** — the cache of attention key/value tensors an autoregressive model reuses across decoding steps; "paged" means managing it in fixed-size blocks like OS virtual memory to avoid fragmentation under continuous batching.
 - **Latency percentiles (p50 / p99 / p99.9)** — the median and tail latencies of a request-latency distribution; systems are budgeted and reported against tails, not just the mean, because tails are what breach an SLO.
@@ -439,10 +455,12 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 - **Multi-tenant platform** — a single serving system shared by many teams' models, as opposed to a dedicated service for one model; it needs isolation, per-tenant quotas, and a shared rollout/registry mechanism.
 - **OTA (Over-The-Air) update** — pushing a new model version to edge/on-device deployments remotely, without physical access to the device.
 - **Progressive delivery (rollout ladder)** — shipping a new model version through increasing exposure stages — offline eval, shadow, canary, progressive ramp, full rollout — each gated by guardrail checks.
+- **Protocol Buffers (protobuf)** — Google's compact binary serialization format with a strongly-typed `.proto` schema; what gRPC uses on the wire instead of JSON, shrinking payloads and enforcing a contract between client and server.
 - **Pruning / sparsity** — removing low-importance weights from a trained model to shrink and speed it up.
 - **Quantization** — running a model's weights/activations at lower numerical precision (FP16/BF16, INT8, FP8/INT4) to cut memory and compute cost, typically with little to no accuracy loss.
 - **Queue depth** — the number of requests waiting to be batched/served; a signal used for autoscaling since it reflects real load on a GPU service better than CPU usage does.
 - **RED monitoring (Rate, Errors, Duration)** — an operational monitoring framework tracking request rate, error rate, and latency (duration), per model version.
+- **REST (Representational State Transfer)** — an HTTP-based API style using plain methods (GET/POST/etc.) and typically JSON payloads; the usual choice for public/client-facing APIs because of universal tooling and human-readable debugging.
 - **Rollback (instant rollback)** — reverting to the previous model version by flipping a traffic pointer to an already-warm deployment, rather than redeploying, so it takes seconds.
 - **RPC (Remote Procedure Call)** — the "reframe as a systems problem" model for this question: a request travels a defined path (client → gateway → batcher → model server → post-process) with a latency budget, like any other network service call.
 - **Shadow deployment** — sending a mirrored copy of live traffic to a new model version whose output is discarded (never shown to users), validating it against production traffic at zero user risk.
@@ -458,6 +476,10 @@ Memorize this order; it's your whiteboard spine for a 45-minute pass.
 ---
 
 ## 16. Further reading & tools
+
+**Protocols:**
+- [gRPC](https://grpc.io) — the RPC framework behind most internal service-to-service serving traffic; HTTP/2 + Protocol Buffers.
+- [Protocol Buffers](https://protobuf.dev) — the binary serialization format gRPC uses on the wire.
 
 **Serving frameworks & orchestration:**
 - [Triton Inference Server](https://github.com/triton-inference-server/server) — NVIDIA's model server; dynamic batching, multi-framework support, GPU concurrency.
